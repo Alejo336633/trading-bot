@@ -1,0 +1,8 @@
+{
+  "symbol": "BTC/USDT",
+  "direction": "long",
+  "entry": 72000,
+  "stopLoss": 70500,
+  "takeProfit": 75500,
+  "reason": "RSI oversold at 32, support at $72K, MACD bullish divergence forming"
+}

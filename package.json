@@ -1,0 +1,18 @@
+{
+  "name": "trading-bot",
+  "version": "1.0.0",
+  "description": "AI-assisted trading bot for Binance - starts with testnet paper trading",
+  "type": "module",
+  "main": "src/bot.js",
+  "scripts": {
+    "start": "node src/bot.js",
+    "paper": "node src/bot.js --mode paper",
+    "live": "node src/bot.js --mode live",
+    "status": "node src/status.js",
+    "history": "node src/history.js",
+    "test": "node --test tests/bot.test.js"
+  },
+  "dependencies": {
+    "ccxt": "^4.4.0"
+  }
+}
