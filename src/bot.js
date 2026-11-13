@@ -6,15 +6,22 @@
  *   node src/bot.js                     — show status
  *   node src/bot.js execute <setup.json> — execute a trade setup
  *   node src/bot.js close <tradeId>     — close a position
- *   node src/bot.js monitor             — monitor open positions
+ *   node src/bot.js monitor             — sync with the exchange and show open positions
+ *   node src/bot.js sync                — update the journal from the exchange
+ *   node src/bot.js protect <tradeId>   — place stop loss + take profit on the exchange
  *   node src/bot.js balance             — show account balance
  *   node src/bot.js stats               — show trade statistics
  */
 import { config, isPaper, validateConfig } from './config.js';
-import { getExchange, getPrice, getBalance, buyMarket, buyLimit, sellMarket, sellLimit, getOpenOrders } from './exchange.js';
+import { getPrice, getBalance, buyMarket, buyLimit, sellMarket, fetchOrder, cancelOrder, placeProtection, cancelProtection } from './exchange.js';
 import { calculatePositionSize, canOpenTrade, validateSetup } from './risk.js';
-import { recordEntry, recordExit, getOpenPositions, getStats, loadTrades } from './journal.js';
+import { recordEntry, recordExit, updateTrade, getOpenPositions, getPendingEntries, getStats, loadTrades } from './journal.js';
+import { summarizeFill } from './fills.js';
+import { syncTrades, protectTrade } from './sync.js';
 import { readFileSync } from 'fs';
+
+// Exchange functions the journal sync needs.
+const exchangeApi = { fetchOrder, placeProtection };
 
 const [,, command, ...args] = process.argv;
 
@@ -51,6 +58,12 @@ async function main() {
       break;
     case 'monitor':
       await monitorPositions();
+      break;
+    case 'sync':
+      await runSync();
+      break;
+    case 'protect':
+      await protectPosition(args[0]);
       break;
     case 'balance':
       await showBalance();
@@ -141,97 +154,177 @@ async function executeSetup(setupPath) {
     const currentPrice = await getPrice(setup.symbol);
     console.log(`💰 Current price: $${currentPrice.price}`);
 
-    let order;
     const amount = sizing.needsLeverage
       ? (config.tradingCapital * 0.95) / setup.entry  // Use 95% of capital max
       : sizing.positionUnits;
 
-    if (setup.direction === 'long') {
-      if (Math.abs(currentPrice.price - setup.entry) / setup.entry < 0.005) {
-        // Within 0.5% of entry — market order
-        console.log('🟢 Market BUY (within 0.5% of entry)...');
-        order = await buyMarket(setup.symbol, amount);
-      } else {
-        // Set limit order at entry
-        console.log(`📝 Limit BUY at $${setup.entry}...`);
-        order = await buyLimit(setup.symbol, amount, setup.entry);
-      }
-    } else {
-      // Short — sell (need to have the asset)
-      if (Math.abs(currentPrice.price - setup.entry) / setup.entry < 0.005) {
-        console.log('🔴 Market SELL...');
-        order = await sellMarket(setup.symbol, amount);
-      } else {
-        console.log(`📝 Limit SELL at $${setup.entry}...`);
-        order = await sellLimit(setup.symbol, amount, setup.entry);
-      }
-    }
-
-    console.log(`✅ Order placed: ${order.id} (${order.status})`);
-
-    // Record in journal
-    const entry = recordEntry({
+    const base = {
       symbol: setup.symbol,
       direction: setup.direction,
-      entry: order.price || setup.entry,
+      plannedEntry: setup.entry,
       stopLoss: setup.stopLoss,
       takeProfit: setup.takeProfit,
-      amount: amount,
-      amountUSDT: amount * (order.price || setup.entry),
-      orderId: order.id,
       reason: setup.reason || '',
-    });
+    };
 
-    console.log(`📓 Recorded in journal: ${entry.id}`);
-    console.log('');
-    console.log('⏳ Set stop loss and take profit orders manually or wait for monitor.');
+    if (Math.abs(currentPrice.price - setup.entry) / setup.entry < 0.005) {
+      // Within 0.5% of entry — market order, filled immediately
+      console.log('🟢 Market BUY (within 0.5% of entry)...');
+      const order = await buyMarket(setup.symbol, amount);
+      const fill = summarizeFill(order, setup.symbol);
+      console.log(`✅ Filled: ${fill.amount} @ $${fill.price} (order ${order.id})`);
+
+      const trade = recordEntry({
+        ...base,
+        status: 'open',
+        entry: fill.price,
+        amount: fill.netAmount,
+        amountUSDT: fill.cost,
+        fees: fill.feeQuote,
+        orderId: order.id,
+      });
+      console.log(`📓 Recorded in journal: ${trade.id}`);
+      await tryProtect(trade);
+    } else {
+      // Limit order at the planned entry: not a position until it fills
+      console.log(`📝 Limit BUY at $${setup.entry}...`);
+      const order = await buyLimit(setup.symbol, amount, setup.entry);
+      console.log(`✅ Order placed: ${order.id} (${order.status})`);
+
+      const trade = recordEntry({
+        ...base,
+        status: 'pending',
+        entry: setup.entry,
+        amount,
+        amountUSDT: amount * setup.entry,
+        orderId: order.id,
+      });
+      console.log(`📓 Recorded as PENDING: ${trade.id}`);
+      console.log('');
+      console.log('⏳ Run "node src/bot.js sync" to check the fill. Stop loss and take profit');
+      console.log('   are placed on the exchange automatically once the entry fills.');
+    }
 
   } catch (err) {
     console.log(`❌ Execution failed: ${err.message}`);
   }
 }
 
+/**
+ * Place stop loss + take profit on the exchange; never fail silently.
+ */
+async function tryProtect(trade) {
+  try {
+    const protection = await protectTrade(trade, exchangeApi);
+    console.log(`🛡️  Stop loss $${trade.stopLoss} and take profit $${trade.takeProfit} placed on the exchange (OCO ${protection.orderListId})`);
+    return true;
+  } catch (err) {
+    console.log('');
+    console.log(`🚨 POSITION ${trade.id} HAS NO STOP LOSS ON THE EXCHANGE: ${err.message}`);
+    console.log(`   Retry with: node src/bot.js protect ${trade.id}`);
+    console.log(`   or close it: node src/bot.js close ${trade.id}`);
+    return false;
+  }
+}
+
+function printSyncEvents(events) {
+  for (const e of events) {
+    if (e.type === 'filled') console.log(`✅ ${e.id}: entry filled — ${e.amount} @ $${e.price}`);
+    else if (e.type === 'protected') console.log(`🛡️  ${e.id}: stop loss and take profit placed (OCO ${e.orderListId})`);
+    else if (e.type === 'unprotected') console.log(`🚨 ${e.id}: NO STOP LOSS ON THE EXCHANGE — ${e.message}. Run: node src/bot.js protect ${e.id}`);
+    else if (e.type === 'cancelled') console.log(`🚫 ${e.id}: entry order was cancelled without filling`);
+    else if (e.type === 'closed') console.log(`${e.pnl >= 0 ? '🟢' : '🔴'} ${e.id}: closed by ${e.reason} @ $${e.price} — P&L $${e.pnl.toFixed(2)}`);
+    else if (e.type === 'error') console.log(`⚠️  ${e.id}: could not sync — ${e.message}`);
+  }
+}
+
+async function runSync() {
+  const events = await syncTrades(exchangeApi);
+  if (events.length === 0) console.log('Journal is in sync with the exchange. Nothing changed.');
+  else printSyncEvents(events);
+}
+
+async function protectPosition(tradeId) {
+  const unprotected = getOpenPositions().filter(t => !t.protection);
+  if (!tradeId) {
+    if (unprotected.length === 0) {
+      console.log('Every open position already has its stop loss and take profit on the exchange.');
+      return;
+    }
+    console.log('Open positions WITHOUT protection:');
+    unprotected.forEach(t => console.log(`  ${t.id} | ${t.symbol} | SL: $${t.stopLoss} | TP: $${t.takeProfit}`));
+    console.log('');
+    console.log('Usage: node src/bot.js protect <tradeId>');
+    return;
+  }
+
+  const trade = unprotected.find(t => t.id === tradeId);
+  if (!trade) {
+    console.log(`❌ Trade ${tradeId} not found, not open, or already protected.`);
+    return;
+  }
+  await tryProtect(trade);
+}
+
 async function closePosition(tradeId) {
   if (!tradeId) {
     const open = getOpenPositions();
-    if (open.length === 0) {
-      console.log('No open positions.');
+    const pending = getPendingEntries();
+    if (open.length === 0 && pending.length === 0) {
+      console.log('No open positions or pending entries.');
       return;
     }
-    console.log('Open positions:');
     open.forEach(t => {
-      console.log(`  ${t.id} | ${t.symbol} ${t.direction} | Entry: $${t.entry} | SL: $${t.stopLoss} | TP: $${t.takeProfit}`);
+      console.log(`  OPEN    ${t.id} | ${t.symbol} ${t.direction} | Entry: $${t.entry} | SL: $${t.stopLoss} | TP: $${t.takeProfit}`);
+    });
+    pending.forEach(t => {
+      console.log(`  PENDING ${t.id} | ${t.symbol} ${t.direction} | Limit: $${t.plannedEntry}`);
     });
     console.log('');
     console.log('Usage: node src/bot.js close <tradeId>');
     return;
   }
 
-  const trade = getOpenPositions().find(t => t.id === tradeId);
+  const trade = loadTrades().find(t => t.id === tradeId && ['open', 'pending'].includes(t.status));
   if (!trade) {
     console.log(`❌ Trade ${tradeId} not found or not open.`);
     return;
   }
 
   try {
-    const currentPrice = await getPrice(trade.symbol);
-    console.log(`Closing ${trade.symbol} ${trade.direction} at $${currentPrice.price}...`);
-
-    let order;
-    if (trade.direction === 'long') {
-      order = await sellMarket(trade.symbol, trade.amount);
-    } else {
-      order = await buyMarket(trade.symbol, trade.amount);
+    if (trade.status === 'pending') {
+      await cancelOrder(trade.entryOrderId, trade.symbol);
+      updateTrade(trade.id, { status: 'cancelled', closedAt: new Date().toISOString() });
+      console.log(`🚫 Pending entry ${trade.id} cancelled.`);
+      return;
     }
 
-    const closed = recordExit(tradeId, currentPrice.price, order.price * trade.amount * 0.001);
-    console.log(`✅ Position closed. P&L: $${closed.pnl} (${closed.pnlPercent.toFixed(2)}%)`);
+    // Free the coins held by the protective orders before selling.
+    if (trade.protection) {
+      await cancelProtection(trade.symbol, trade.protection.orderListId);
+      updateTrade(trade.id, { protection: null });
+      console.log('Protective orders cancelled.');
+    }
+
+    console.log(`Closing ${trade.symbol} ${trade.direction} at market...`);
+    const order = await sellMarket(trade.symbol, trade.amount);
+    const fill = summarizeFill(order, trade.symbol);
+
+    const closed = recordExit(tradeId, fill.price, fill.feeQuote, 'manual');
+    console.log(`✅ Position closed @ $${fill.price}. P&L: $${closed.pnl.toFixed(2)} (${closed.pnlPercent.toFixed(2)}%)`);
   } catch (err) {
     console.log(`❌ Close failed: ${err.message}`);
+    console.log('   Check the position on the exchange: it may now be without protection.');
   }
 }
 
 async function monitorPositions() {
+  // First bring the journal in line with the exchange (fills, stops hit).
+  printSyncEvents(await syncTrades(exchangeApi));
+
+  const pending = getPendingEntries();
+  pending.forEach(t => console.log(`⏳ ${t.id} | ${t.symbol} — limit entry at $${t.plannedEntry} not filled yet`));
+
   const open = getOpenPositions();
   if (open.length === 0) {
     console.log('No open positions to monitor.');
@@ -261,6 +354,9 @@ async function monitorPositions() {
       console.log(`${trade.id} | ${trade.symbol} ${trade.direction.toUpperCase()}`);
       console.log(`  Entry: $${trade.entry} | Now: $${current.price} | P&L: $${unrealizedPnL.toFixed(2)} (${pnlPercent.toFixed(2)}%)`);
       console.log(`  SL: $${trade.stopLoss} | TP: $${trade.takeProfit} | ${status}`);
+      console.log(trade.protection
+        ? `  🛡️  Protected on the exchange (OCO ${trade.protection.orderListId})`
+        : `  🚨 NO STOP LOSS ON THE EXCHANGE — run: node src/bot.js protect ${trade.id}`);
       console.log('');
     } catch (err) {
       console.log(`${trade.id} | ${trade.symbol} — Error: ${err.message}`);
@@ -335,14 +431,16 @@ function showStatus() {
     console.log(`Closed trades: ${stats.totalTrades} | Win rate: ${stats.winRate}% | P&L: $${stats.totalPnL}`);
   }
   console.log('');
-  console.log('Commands: execute, close, monitor, balance, price, size, stats, help');
+  console.log('Commands: execute, close, monitor, sync, protect, balance, price, size, stats, help');
 }
 
 function showHelp() {
   console.log('Commands:');
   console.log('  execute <setup.json>  Execute a trade setup from JSON file');
   console.log('  close [tradeId]       Close a position (lists open if no ID)');
-  console.log('  monitor               Check all open positions vs current price');
+  console.log('  monitor               Sync with the exchange, then show open positions');
+  console.log('  sync                  Update the journal from the exchange (fills, stops hit)');
+  console.log('  protect [tradeId]     Place stop loss + take profit on the exchange for a position');
   console.log('  balance               Show account balance');
   console.log('  price <PAIR>          Show current price (e.g., BTC/USDT)');
   console.log('  size <entry> <sl>     Calculate position size');

@@ -5,6 +5,9 @@
 import ccxt from 'ccxt';
 import { config, isPaper } from './config.js';
 
+// How far below the stop trigger the stop-limit order may fill (0.2%).
+const STOP_LIMIT_SLIPPAGE = 0.002;
+
 let exchange = null;
 
 export function getExchange() {
@@ -117,6 +120,59 @@ export async function cancelOrder(orderId, symbol) {
 }
 
 /**
+ * Fetch one order with its real fill data.
+ */
+export async function fetchOrder(orderId, symbol) {
+  const ex = getExchange();
+  return formatOrder(await ex.fetchOrder(orderId, symbol));
+}
+
+/**
+ * Place the protective pair for a long position as one OCO order list:
+ * a take profit (limit) above the price and a stop loss below it. When one
+ * fills, Binance cancels the other. The orders live on the exchange, so they
+ * work even when the bot is not running.
+ */
+export async function placeProtection(symbol, amount, takeProfit, stopLoss) {
+  const ex = getExchange();
+  await ex.loadMarkets();
+  const market = ex.market(symbol);
+
+  const response = await ex.privatePostOrderListOco({
+    symbol: market.id,
+    side: 'SELL',
+    quantity: ex.amountToPrecision(symbol, amount),
+    aboveType: 'LIMIT_MAKER',
+    abovePrice: ex.priceToPrecision(symbol, takeProfit),
+    belowType: 'STOP_LOSS_LIMIT',
+    belowStopPrice: ex.priceToPrecision(symbol, stopLoss),
+    // Limit slightly under the trigger so the stop still fills in a fast move.
+    belowPrice: ex.priceToPrecision(symbol, stopLoss * (1 - STOP_LIMIT_SLIPPAGE)),
+    belowTimeInForce: 'GTC',
+  });
+
+  const reports = response.orderReports || [];
+  const tp = reports.find(o => o.type === 'LIMIT_MAKER');
+  const sl = reports.find(o => o.type === 'STOP_LOSS_LIMIT');
+  if (!tp || !sl) throw new Error('Exchange did not return both protective orders');
+
+  return {
+    orderListId: String(response.orderListId),
+    tpOrderId: String(tp.orderId),
+    slOrderId: String(sl.orderId),
+  };
+}
+
+/**
+ * Cancel a protective OCO order list (before closing a position manually).
+ */
+export async function cancelProtection(symbol, orderListId) {
+  const ex = getExchange();
+  await ex.loadMarkets();
+  return await ex.privateDeleteOrderList({ symbol: ex.market(symbol).id, orderListId });
+}
+
+/**
  * Get open orders.
  */
 export async function getOpenOrders(symbol) {
@@ -132,6 +188,10 @@ function formatOrder(order) {
     type: order.type,
     side: order.side,
     price: order.price,
+    average: order.average,
+    cost: order.cost,
+    fee: order.fee,
+    fees: order.fees,
     amount: order.amount,
     filled: order.filled,
     remaining: order.remaining,

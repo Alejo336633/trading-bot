@@ -43,8 +43,11 @@ export const config = {
   // Capital
   tradingCapital: parseFloat(env.TRADING_CAPITAL || '1000'),         // USDT
 
-  // Paths
-  tradesPath: resolve(ROOT, 'trades.json'),
+  // Live trading needs a second, explicit switch in .env (see validateConfig)
+  liveConfirm: env.LIVE_CONFIRM || '',
+
+  // Paths (TRADES_PATH lets the tests use a throwaway journal)
+  tradesPath: process.env.TRADES_PATH || resolve(ROOT, 'trades.json'),
 
   // Supported pairs for the bot
   pairs: ['BTC/USDT', 'ETH/USDT'],
@@ -56,6 +59,9 @@ export const config = {
   },
 };
 
+// Changing TRADING_MODE alone is not enough to reach real money.
+export const LIVE_CONFIRM_PHRASE = 'YES_REAL_MONEY';
+
 export function isPaper() {
   return config.mode === 'paper';
 }
@@ -65,6 +71,12 @@ export function validateConfig() {
   if (!config.apiKey) errors.push('BINANCE_API_KEY not set');
   if (!config.secretKey) errors.push('BINANCE_SECRET_KEY not set');
   if (config.maxRiskPerTrade > 0.05) errors.push('MAX_RISK_PER_TRADE > 5% is dangerous');
+  if (!['paper', 'live'].includes(config.mode)) {
+    errors.push(`TRADING_MODE must be "paper" or "live" (got "${config.mode}")`);
+  }
+  if (config.mode === 'live' && config.liveConfirm !== LIVE_CONFIRM_PHRASE) {
+    errors.push(`Live mode is locked. To trade real money add LIVE_CONFIRM=${LIVE_CONFIRM_PHRASE} to .env`);
+  }
   if (config.mode === 'live' && config.tradingCapital > 10000) {
     errors.push('Capital > $10,000 in live mode - double check this is intentional');
   }

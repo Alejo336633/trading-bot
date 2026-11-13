@@ -35,8 +35,8 @@ function main() {
   for (const t of list.reverse()) {
     const pnlStr = t.pnl !== null
       ? `P&L: $${t.pnl.toFixed(2)} (${t.pnlPercent.toFixed(2)}%)`
-      : 'P&L: pending';
-    const statusIcon = t.status === 'open' ? '⏳' : t.pnl > 0 ? '✅' : '❌';
+      : `P&L: — (${t.status})`;
+    const statusIcon = t.status === 'open' ? '⏳' : t.status === 'pending' ? '🕓' : t.status === 'cancelled' ? '🚫' : t.pnl > 0 ? '✅' : '❌';
 
     console.log(`${statusIcon} ${t.id} | ${t.symbol} ${t.direction.toUpperCase()}`);
     console.log(`   Entry: $${t.entry} | Exit: ${t.exitPrice ? '$' + t.exitPrice : '—'} | ${pnlStr}`);

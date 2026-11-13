@@ -49,8 +49,8 @@ export function canOpenTrade() {
   const trades = loadTrades();
   const today = new Date().toISOString().split('T')[0];
 
-  // Count open positions
-  const openPositions = trades.filter(t => t.status === 'open').length;
+  // Count open positions plus entries still waiting to fill: both commit capital
+  const openPositions = trades.filter(t => t.status === 'open' || t.status === 'pending').length;
   if (openPositions >= config.maxOpenPositions) {
     return { allowed: false, reason: `Max open positions (${config.maxOpenPositions}) reached. Currently: ${openPositions}` };
   }
@@ -77,6 +77,13 @@ export function validateSetup(setup) {
   if (!setup.entry) errors.push('Entry price required');
   if (!setup.stopLoss) errors.push('Stop loss required');
   if (!setup.takeProfit) errors.push('Take profit required');
+
+  // Spot accounts cannot short: a "short" here would just sell coins you may not hold.
+  if (setup.direction === 'short') {
+    errors.push('Short setups are not supported: this bot trades spot, where shorting is not possible');
+  } else if (setup.direction !== 'long') {
+    errors.push('Direction must be "long"');
+  }
 
   if (setup.entry && setup.stopLoss && setup.takeProfit) {
     const isLong = setup.direction === 'long';

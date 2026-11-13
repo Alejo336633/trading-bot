@@ -1,6 +1,12 @@
 /**
  * Trading journal — records every trade for analysis.
  * Stores in trades.json for persistence.
+ *
+ * Trade statuses:
+ *   pending   — limit entry order placed, not filled yet (not a position)
+ *   open      — entry filled; the position exists on the exchange
+ *   closed    — position exited (take profit, stop loss or manual)
+ *   cancelled — entry order never filled and was cancelled
  */
 import { readFileSync, writeFileSync, existsSync } from 'fs';
 import { config } from './config.js';
@@ -25,25 +31,29 @@ function saveTrades(trades) {
 }
 
 /**
- * Record a new trade entry.
+ * Record a new trade. Pass status 'pending' for an unfilled limit entry.
  */
 export function recordEntry(trade) {
   const trades = loadTrades();
   const entry = {
     id: `T${Date.now()}`,
     symbol: trade.symbol,
-    direction: trade.direction, // 'long' or 'short'
+    direction: trade.direction,
+    plannedEntry: trade.plannedEntry ?? trade.entry,
     entry: trade.entry,
     stopLoss: trade.stopLoss,
     takeProfit: trade.takeProfit,
     amount: trade.amount,
     amountUSDT: trade.amountUSDT,
     orderId: trade.orderId || null,
-    status: 'open',
+    entryOrderId: trade.orderId || null,
+    protection: trade.protection || null,
+    status: trade.status || 'open',
     reason: trade.reason || '',
     openedAt: new Date().toISOString(),
     closedAt: null,
     exitPrice: null,
+    exitReason: null,
     pnl: null,
     pnlPercent: null,
     fees: trade.fees || 0,
@@ -54,9 +64,22 @@ export function recordEntry(trade) {
 }
 
 /**
- * Record trade exit.
+ * Merge changes into an existing trade.
  */
-export function recordExit(tradeId, exitPrice, fees = 0) {
+export function updateTrade(tradeId, patch) {
+  const trades = loadTrades();
+  const trade = trades.find(t => t.id === tradeId);
+  if (!trade) throw new Error(`Trade ${tradeId} not found`);
+  Object.assign(trade, patch);
+  saveTrades(trades);
+  return trade;
+}
+
+/**
+ * Record trade exit.
+ * @param {string} exitReason - 'take_profit' | 'stop_loss' | 'manual'
+ */
+export function recordExit(tradeId, exitPrice, fees = 0, exitReason = 'manual') {
   const trades = loadTrades();
   const trade = trades.find(t => t.id === tradeId);
   if (!trade) throw new Error(`Trade ${tradeId} not found`);
@@ -64,7 +87,9 @@ export function recordExit(tradeId, exitPrice, fees = 0) {
   trade.status = 'closed';
   trade.closedAt = new Date().toISOString();
   trade.exitPrice = exitPrice;
-  trade.fees += fees;
+  trade.exitReason = exitReason;
+  trade.protection = null;
+  trade.fees = (trade.fees || 0) + fees;
 
   if (trade.direction === 'long') {
     trade.pnl = (exitPrice - trade.entry) * trade.amount - trade.fees;
@@ -78,10 +103,17 @@ export function recordExit(tradeId, exitPrice, fees = 0) {
 }
 
 /**
- * Get open positions.
+ * Get open positions (entry filled, not exited).
  */
 export function getOpenPositions() {
   return loadTrades().filter(t => t.status === 'open');
+}
+
+/**
+ * Get limit entries that have not filled yet.
+ */
+export function getPendingEntries() {
+  return loadTrades().filter(t => t.status === 'pending');
 }
 
 /**

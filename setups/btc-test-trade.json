@@ -1,0 +1,8 @@
+{
+  "symbol": "BTC/USDT",
+  "direction": "long",
+  "entry": 73157,
+  "stopLoss": 71700,
+  "takeProfit": 76800,
+  "reason": "Test trade - paper trading on Binance testnet"
+}
